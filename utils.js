@@ -1,6 +1,7 @@
 const crypto    = require('crypto');
 const base64url = require('base64url');
 const cbor      = require('cbor');
+const cose      = require('cose');
 
 /**
  * U2F Presence constant
@@ -75,7 +76,7 @@ let generateServerGetAssertion = (authenticators) => {
     for(let authr of authenticators) {
         allowCredentials.push({
               type: 'public-key',
-              id: authr.credID,
+              id: authr.credId,
               transports: ['usb', 'nfc', 'ble']
         })
     }
@@ -173,54 +174,125 @@ let ASN1toPEM = (pkBuffer) => {
     return PEMKey
 }
 
-/**
- * Parses authenticatorData buffer.
- * @param  {Buffer} buffer - authenticatorData buffer
- * @return {Object}        - parsed authenticatorData struct
- */
-let parseMakeCredAuthData = (buffer) => {
-    let rpIdHash      = buffer.slice(0, 32);          buffer = buffer.slice(32);
-    let flagsBuf      = buffer.slice(0, 1);           buffer = buffer.slice(1);
-    let flags         = flagsBuf[0];
-    let counterBuf    = buffer.slice(0, 4);           buffer = buffer.slice(4);
-    let counter       = counterBuf.readUInt32BE(0);
-    let aaguid        = buffer.slice(0, 16);          buffer = buffer.slice(16);
-    let credIDLenBuf  = buffer.slice(0, 2);           buffer = buffer.slice(2);
-    let credIDLen     = credIDLenBuf.readUInt16BE(0);
-    let credID        = buffer.slice(0, credIDLen);   buffer = buffer.slice(credIDLen);
-    let COSEPublicKey = buffer;
+const parseAuthData = (buffer) => {
+    if(buffer.byteLength < 37)
+        throw new Error('Authenticator Data must be at least 37 bytes long!');
 
-    return {rpIdHash, flagsBuf, flags, counter, counterBuf, aaguid, credID, COSEPublicKey}
+    let rpIdHash      = buffer.slice(0, 32);             buffer = buffer.slice(32);
+
+    /* Flags */
+    let flagsBuffer   = buffer.slice(0, 1);              buffer = buffer.slice(1);
+    let flagsInt      = flagsBuffer[0];
+    let up            = !!(flagsInt & 0x01); // Test of User Presence
+    let uv            = !!(flagsInt & 0x04); // User Verification
+    let at            = !!(flagsInt & 0x40); // Attestation data
+    let ed            = !!(flagsInt & 0x80); // Extension data
+    let flags = {up, uv, at, ed, flagsInt};
+
+    let counterBuffer = buffer.slice(0, 4);               buffer = buffer.slice(4);
+    let counter       = counterBuffer.readUInt32BE(0);
+
+    /* Attested credential data */
+    let aaguid              = undefined;
+    let aaguidBuffer        = undefined;
+    let credIdBuffer        = undefined;
+    let cosePublicKeyBuffer = undefined;
+    let attestationMinLen   = 16 + 2 + 16 + 77; // aaguid + credIdLen + credId + pk
+
+
+    if(at) { // Attested Data
+        if(buffer.byteLength < attestationMinLen)
+            throw new Error(`It seems as the Attestation Data flag is set, but the remaining data is smaller than ${attestationMinLen} bytes. You might have set AT flag for the assertion response.`)
+
+        aaguid              = buffer.slice(0, 16).toString('hex'); buffer = buffer.slice(16);
+        aaguidBuffer        = `${aaguid.slice(0, 8)}-${aaguid.slice(8, 12)}-${aaguid.slice(12, 16)}-${aaguid.slice(16, 20)}-${aaguid.slice(20)}`;
+
+        let credIdLenBuffer = buffer.slice(0, 2);                  buffer = buffer.slice(2);
+        let credIdLen       = credIdLenBuffer.readUInt16BE(0);
+        credIdBuffer        = buffer.slice(0, credIdLen);          buffer = buffer.slice(credIdLen);
+
+        let pubKeyLength    = vanillaCBOR.decodeOnlyFirst(buffer).byteLength;
+        cosePublicKeyBuffer = buffer.slice(0, pubKeyLength);       buffer = buffer.slice(pubKeyLength);
+    }
+
+    let coseExtensionsDataBuffer = undefined;
+    if(ed) { // Extension Data
+        let extensionsDataLength = vanillaCBOR.decodeOnlyFirst(buffer).byteLength;
+
+        coseExtensionsDataBuffer = buffer.slice(0, extensionsDataLength); buffer = buffer.slice(extensionsDataLength);
+    }
+
+    if(buffer.byteLength)
+        throw new Error('Failed to decode authData! Leftover bytes been detected!');
+
+    return {rpIdHash, counter, flags, counterBuffer, aaguid, credIdBuffer, cosePublicKeyBuffer, coseExtensionsDataBuffer}
 }
 
 let verifyAuthenticatorAttestationResponse = (webAuthnResponse) => {
-    let attestationBuffer = base64url.toBuffer(webAuthnResponse.response.attestationObject);
-    let ctapMakeCredResp  = cbor.decodeAllSync(attestationBuffer)[0];
+    let attestationBuffer   = base64url.toBuffer(webAuthnResponse.response.attestationObject);
+    let attestationStruct   = cbor.decodeAllSync(attestationBuffer)[0];
+    let authDataStruct      = parseAuthData(attestationStruct.authData);
+    let clientDataHash      = hash(base64url.toBuffer(webAuthnResponse.response.clientDataJSON))
+    let signatureBuffer     = attestationStruct.attStmt.sig;
+    let signatureBaseBuffer = Buffer.concat([attestationStruct.authData, clientDataHash]);
 
     let response = {'verified': false};
-    if(ctapMakeCredResp.fmt === 'fido-u2f') {
-        let authrDataStruct = parseMakeCredAuthData(ctapMakeCredResp.authData);
+    if(attestationStruct.fmt === 'fido-u2f') {
+        if(!authDataStruct.flags.up) {
+            console.log('User was NOT presented durring authentication!');
+            return response
+        }
 
-        if(!(authrDataStruct.flags & U2F_USER_PRESENTED))
-            throw new Error('User was NOT presented durring authentication!');
-
-        let clientDataHash  = hash(base64url.toBuffer(webAuthnResponse.response.clientDataJSON))
         let reservedByte    = Buffer.from([0x00]);
-        let publicKey       = COSEECDHAtoPKCS(authrDataStruct.COSEPublicKey)
-        let signatureBase   = Buffer.concat([reservedByte, authrDataStruct.rpIdHash, clientDataHash, authrDataStruct.credID, publicKey]);
+        let publicKey       = COSEECDHAtoPKCS(authDataStruct.cosePublicKeyBuffer);
+        let signatureBase   = Buffer.concat([reservedByte, authDataStruct.rpIdHash, clientDataHash, authDataStruct.credIdBuffer, publicKey]);
 
-        let PEMCertificate = ASN1toPEM(ctapMakeCredResp.attStmt.x5c[0]);
-        let signature      = ctapMakeCredResp.attStmt.sig;
+        let PEMCertificate = ASN1toPEM(attestationStruct.attStmt.x5c[0]);
 
-        response.verified = verifySignature(signature, signatureBase, PEMCertificate)
+        response.verified = verifySignature(signatureBuffer, signatureBase, PEMCertificate)
+    } else if(attestationStruct.fmt === 'packed') {
+        if(attestationStruct.attStmt.x5c) {
+        /* ----- Verify FULL attestation ----- */
+            let leafCert = base64ToPem(attestationStruct.attStmt.x5c[0].toString('base64'));
+            let certInfo = getCertificateInfo(leafCert);
 
-        if(response.verified) {
-            response.authrInfo = {
-                fmt: 'fido-u2f',
-                publicKey: base64url.encode(publicKey),
-                counter: authrDataStruct.counter,
-                credID: base64url.encode(authrDataStruct.credID)
-            }
+            if(certInfo.subject.OU !== 'Authenticator Attestation')
+                throw new Error('Batch certificate OU MUST be set strictly to "Authenticator Attestation"!');
+
+            if(!certInfo.subject.CN)
+                throw new Error('Batch certificate CN MUST no be empty!');
+
+            if(!certInfo.subject.O)
+                throw new Error('Batch certificate CN MUST no be empty!');
+
+            if(!certInfo.subject.C || certInfo.subject.C.length !== 2)
+                throw new Error('Batch certificate C MUST be set to two character ISO 3166 code!');
+
+            if(certInfo.basicConstraintsCA)
+                throw new Error('Batch certificate basic constraints CA MUST be false!');
+
+            if(certInfo.version !== 3)
+                throw new Error('Batch certificate version MUST be 3(ASN1 2)!');
+
+            response.verified = crypto.createVerify('sha256')
+            .update(signatureBaseBuffer)
+            .verify(leafCert, signatureBuffer);
+        /* ----- Verify FULL attestation ENDS ----- */
+        } else if(attestationStruct.attStmt.ecdaaKeyId) {
+            throw new Error('ECDAA IS NOT SUPPORTED YET!');
+        } else {
+        /* ----- Verify SURROGATE attestation ----- */
+            response.verified = cose.verifySignature(signatureBuffer, signatureBaseBuffer, authDataStruct.cosePublicKeyBuffer);
+        /* ----- Verify SURROGATE attestation ENDS ----- */
+        }
+    }
+
+    if(response.verified) {
+        response.authrInfo = {
+            fmt: 'fido-u2f',
+            publicKey: base64url.encode(publicKey),
+            counter: authDataStruct.counter,
+            credId: base64url.encode(authDataStruct.credIdBuffer)
         }
     }
 
@@ -229,60 +301,41 @@ let verifyAuthenticatorAttestationResponse = (webAuthnResponse) => {
 
 
 /**
- * Takes an array of registered authenticators and find one specified by credID
- * @param  {String} credID        - base64url encoded credential
+ * Takes an array of registered authenticators and find one specified by credId
+ * @param  {String} credId        - base64url encoded credential
  * @param  {Array} authenticators - list of authenticators
  * @return {Object}               - found authenticator
  */
-let findAuthr = (credID, authenticators) => {
+let findAuthr = (credId, authenticators) => {
     for(let authr of authenticators) {
-        if(authr.credID === credID)
+        if(authr.credId === credId)
             return authr
     }
 
-    throw new Error(`Unknown authenticator with credID ${credID}!`)
-}
-
-/**
- * Parses AuthenticatorData from GetAssertion response
- * @param  {Buffer} buffer - Auth data buffer
- * @return {Object}        - parsed authenticatorData struct
- */
-let parseGetAssertAuthData = (buffer) => {
-    let rpIdHash      = buffer.slice(0, 32);          buffer = buffer.slice(32);
-    let flagsBuf      = buffer.slice(0, 1);           buffer = buffer.slice(1);
-    let flags         = flagsBuf[0];
-    let counterBuf    = buffer.slice(0, 4);           buffer = buffer.slice(4);
-    let counter       = counterBuf.readUInt32BE(0);
-
-    return {rpIdHash, flagsBuf, flags, counter, counterBuf}
+    throw new Error(`Unknown authenticator with credId ${credId}!`)
 }
 
 let verifyAuthenticatorAssertionResponse = (webAuthnResponse, authenticators) => {
     let authr = findAuthr(webAuthnResponse.id, authenticators);
-    let authenticatorData = base64url.toBuffer(webAuthnResponse.response.authenticatorData);
+    let clientDataHash      = hash(base64url.toBuffer(webAuthnResponse.response.clientDataJSON))
+    let authDataBuffer      = base64url.toBuffer(webAuthnResponse.response.authenticatorData);
+    let authDataStruct      = parseAuthData(authDataBuffer);
+    let signatureBuffer     = base64url.toBuffer(webAuthnResponse.response.signature);
+    let signatureBaseBuffer = Buffer.concat([attestationStruct.authData, clientDataHash]);
 
     let response = {'verified': false};
-    if(authr.fmt === 'fido-u2f') {
-        let authrDataStruct  = parseGetAssertAuthData(authenticatorData);
+    if(!authDataStruct.flags.up) {
+        console.log('User was NOT presented durring authentication!');
+        return response
+    }
 
-        if(!(authrDataStruct.flags & U2F_USER_PRESENTED))
-            throw new Error('User was NOT presented durring authentication!');
+    response.verified = cose.verifySignature(signatureBuffer, signatureBaseBuffer, authDataStruct.cosePublicKeyBuffer)
 
-        let clientDataHash   = hash(base64url.toBuffer(webAuthnResponse.response.clientDataJSON))
-        let signatureBase    = Buffer.concat([authrDataStruct.rpIdHash, authrDataStruct.flagsBuf, authrDataStruct.counterBuf, clientDataHash]);
+    if(response.verified) {
+        if(authDataStruct.counter <= authr.counter)
+            throw new Error('Authr counter did not increase!');
 
-        let publicKey = ASN1toPEM(base64url.toBuffer(authr.publicKey));
-        let signature = base64url.toBuffer(webAuthnResponse.response.signature);
-
-        response.verified = verifySignature(signature, signatureBase, publicKey)
-
-        if(response.verified) {
-            if(response.counter <= authr.counter)
-                throw new Error('Authr counter did not increase!');
-
-            authr.counter = authrDataStruct.counter
-        }
+        authr.counter = authDataStruct.counter
     }
 
     return response
