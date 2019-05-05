@@ -4,12 +4,15 @@
   "description": "",
   "main": "app.js",
   "dependencies": {
-    "base64url": "^2.0.0",
+    "base64url": "^3.0.1",
     "body-parser": "^1.15.2",
     "cbor": "^3.0.3",
     "cookie-parser": "^1.4.3",
     "cookie-session": "^2.0.0-beta.3",
-    "express": "^4.15.4"
+    "cose": "git+https://github.com/herrjemand/cose.git",
+    "express": "^4.15.4",
+    "jsrsasign": "^8.0.12",
+    "vanillacbor": "git+https://github.com/herrjemand/vanillacbor.git"
   },
   "repository": {
     "type": "git",
