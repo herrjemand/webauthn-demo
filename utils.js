@@ -1,7 +1,8 @@
-const crypto    = require('crypto');
-const base64url = require('base64url');
-const cbor      = require('cbor');
-const cose      = require('cose');
+const crypto       = require('crypto');
+const base64url    = require('base64url');
+const cbor         = require('cbor');
+const cose         = require('cose');
+const vanillacbor  = require('vanillacbor');
 
 /**
  * U2F Presence constant
@@ -211,13 +212,13 @@ const parseAuthData = (buffer) => {
         let credIdLen       = credIdLenBuffer.readUInt16BE(0);
         credIdBuffer        = buffer.slice(0, credIdLen);          buffer = buffer.slice(credIdLen);
 
-        let pubKeyLength    = vanillaCBOR.decodeOnlyFirst(buffer).byteLength;
+        let pubKeyLength    = vanillacbor.decodeOnlyFirst(buffer).byteLength;
         cosePublicKeyBuffer = buffer.slice(0, pubKeyLength);       buffer = buffer.slice(pubKeyLength);
     }
 
     let coseExtensionsDataBuffer = undefined;
     if(ed) { // Extension Data
-        let extensionsDataLength = vanillaCBOR.decodeOnlyFirst(buffer).byteLength;
+        let extensionsDataLength = vanillacbor.decodeOnlyFirst(buffer).byteLength;
 
         coseExtensionsDataBuffer = buffer.slice(0, extensionsDataLength); buffer = buffer.slice(extensionsDataLength);
     }
@@ -290,7 +291,7 @@ let verifyAuthenticatorAttestationResponse = (webAuthnResponse) => {
     if(response.verified) {
         response.authrInfo = {
             fmt: 'fido-u2f',
-            publicKey: base64url.encode(publicKey),
+            cosePublicKey: base64url.encode(authDataStruct.cosePublicKeyBuffer),
             counter: authDataStruct.counter,
             credId: base64url.encode(authDataStruct.credIdBuffer)
         }
@@ -317,11 +318,12 @@ let findAuthr = (credId, authenticators) => {
 
 let verifyAuthenticatorAssertionResponse = (webAuthnResponse, authenticators) => {
     let authr = findAuthr(webAuthnResponse.id, authenticators);
+    let pubKeyBuffer        = base64url.toBuffer(authr.cosePublicKey);
     let clientDataHash      = hash(base64url.toBuffer(webAuthnResponse.response.clientDataJSON))
     let authDataBuffer      = base64url.toBuffer(webAuthnResponse.response.authenticatorData);
     let authDataStruct      = parseAuthData(authDataBuffer);
     let signatureBuffer     = base64url.toBuffer(webAuthnResponse.response.signature);
-    let signatureBaseBuffer = Buffer.concat([attestationStruct.authData, clientDataHash]);
+    let signatureBaseBuffer = Buffer.concat([authDataBuffer, clientDataHash]);
 
     let response = {'verified': false};
     if(!authDataStruct.flags.up) {
@@ -329,7 +331,8 @@ let verifyAuthenticatorAssertionResponse = (webAuthnResponse, authenticators) =>
         return response
     }
 
-    response.verified = cose.verifySignature(signatureBuffer, signatureBaseBuffer, authDataStruct.cosePublicKeyBuffer)
+    console.log()
+    response.verified = cose.verifySignature(signatureBuffer, signatureBaseBuffer, pubKeyBuffer)
 
     if(response.verified) {
         if(authDataStruct.counter <= authr.counter)
